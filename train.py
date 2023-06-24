@@ -504,6 +504,7 @@ def main_worker(gpu, args, config):
                 torch.save(save_obj, os.path.join(log_dir, 'checkpoint_%02d.pth'%epoch)) 
             if float(val_stats['AUC_cls'])>best:
                 torch.save(save_obj, os.path.join(log_dir, 'checkpoint_best.pth')) 
+                print("best checkpoint:",val_stats)
                 best = float(val_stats['AUC_cls'])
                 best_epoch = epoch 
 
