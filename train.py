@@ -411,6 +411,7 @@ def main_worker(gpu, args, config):
     for epoch in range(start_epoch, max_epoch):
             
         train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer) 
+        train_stats
         AUC_cls, ACC_cls, EER_cls, \
         MAP, OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \
         IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
@@ -474,7 +475,7 @@ def main_worker(gpu, args, config):
                      "Recall_tok": "{:.4f}".format(Recall_tok*100),
                      "F1_tok": "{:.4f}".format(F1_tok*100),
         }
-        
+        print(val_stats)
         if utils.is_main_process(): 
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                             **{f'val_{k}': v for k, v in val_stats.items()},
