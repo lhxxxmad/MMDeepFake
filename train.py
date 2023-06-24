@@ -526,7 +526,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', default='') 
     parser.add_argument('--resume', default=False, type=bool)
     parser.add_argument('--output_dir', default='results')
-    parser.add_argument('--text_encoder', default='bert-base-uncased')
+    parser.add_argument('--text_encoder', default='../bert-base-uncased')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=777, type=int)
     parser.add_argument('--distributed', default=True, type=bool)
