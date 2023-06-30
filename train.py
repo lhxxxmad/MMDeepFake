@@ -109,6 +109,7 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
     metric_logger.add_meter('loss_giou', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss_TMG', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss_MLC', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('loss_REC', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     
     header = 'Train Epoch: [{}]'.format(epoch)
@@ -139,7 +140,7 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         else:
             alpha = config['alpha']*min(1,i/len(data_loader)) 
         
-        loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC = model(image, label, text_input, fake_image_box, fake_token_pos, alpha = alpha)  
+        loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC, loss_REC = model(image, label, text_input, fake_image_box, fake_token_pos, alpha = alpha)  
             
         loss = config['loss_MAC_wgt']*loss_MAC \
              + config['loss_BIC_wgt']*loss_BIC \
@@ -147,6 +148,7 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
              + config['loss_giou_wgt']*loss_giou \
              + config['loss_TMG_wgt']*loss_TMG \
              + config['loss_MLC_wgt']*loss_MLC \
+             + config['loss_REC_wgt']*loss_REC
           
         loss.backward()
         optimizer.step()    
@@ -157,6 +159,7 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         metric_logger.update(loss_giou=loss_giou.item())
         metric_logger.update(loss_TMG=loss_TMG.item())
         metric_logger.update(loss_MLC=loss_MLC.item())
+        metric_logger.update(loss_REC=loss_REC.item())
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])         
         
@@ -175,7 +178,8 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
                 'loss_bbox': loss_bbox.item(),                                                                                                  
                 'loss_giou': loss_giou.item(),                                                                                                  
                 'loss_TMG': loss_TMG.item(),                                                                                                  
-                'loss_MLC': loss_MLC.item(),                                                                                                  
+                'loss_MLC': loss_MLC.item(),
+                'loss_MLC': loss_REC.item(),                                                                                                  
                 'loss': loss.item(),                                                                                                  
                     } 
             for tag, value in lossinfo.items():
@@ -401,7 +405,7 @@ def main_worker(gpu, args, config):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
 
     if args.log:

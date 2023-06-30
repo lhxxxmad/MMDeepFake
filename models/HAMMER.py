@@ -12,6 +12,20 @@ import random
 from models import box_ops
 from tools.multilabel_metrics import get_multi_label
 from timm.models.layers import trunc_normal_
+from .transformer import DualTransformer
+import pdb
+
+class CrossEn(nn.Module):
+    def __init__(self, config=None):
+        super(CrossEn, self).__init__()
+
+    def forward(self, sim_matrix, real_pos):
+
+        logpt = F.log_softmax(sim_matrix, dim=-1)
+        logpt = torch.diag(logpt)
+        nce_loss = -logpt * real_pos
+        sim_loss = nce_loss.mean()
+        return sim_loss
 
 class HAMMER(nn.Module):
     def __init__(self, 
@@ -74,13 +88,24 @@ class HAMMER(nn.Module):
                                                                     config=bert_config,
                                                                     label_smoothing=config['label_smoothing'])       
         self.text_proj_m = nn.Linear(text_width, embed_dim)    
-        
+
+        # vision_width = text_width = 768
+        self.text_mlp = nn.Sequential(
+            nn.Linear(text_width, text_width), nn.ReLU(inplace=True),
+            nn.Linear(text_width, 1))
+        self.image_mlp = nn.Sequential(
+            nn.Linear(vision_width, vision_width), nn.ReLU(inplace=True),
+            nn.Linear(vision_width, 1))
+        self.rec_text_trans = DualTransformer()
+        self.rec_image_trans = DualTransformer()
+
         self.model_pairs = [[self.visual_encoder,self.visual_encoder_m],
                             [self.vision_proj,self.vision_proj_m],
                             [self.text_encoder,self.text_encoder_m],
                             [self.text_proj,self.text_proj_m],
                            ]
-        
+        self.mse_loss = nn.MSELoss(reduction='none')
+        self.sim_loss = CrossEn()
         self.copy_params()
 
         # create the queue
@@ -151,6 +176,7 @@ class HAMMER(nn.Module):
         return loss_bbox.sum() / num_boxes, loss_giou.sum() / num_boxes
 
     def forward(self, image, label, text, fake_image_box, fake_text_pos, alpha=0, is_train=True):
+
         if is_train:
             with torch.no_grad():
                 self.temp.clamp_(0.001,0.5)
@@ -160,14 +186,46 @@ class HAMMER(nn.Module):
             ##================= MAC ========================## 
             image_embeds = self.visual_encoder(image) 
             image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(image.device)
-
+            
+            image_sequence = F.normalize(self.vision_proj(image_embeds),dim=-1)
             image_feat = F.normalize(self.vision_proj(image_embeds[:,0,:]),dim=-1)  
 
             text_output = self.text_encoder.bert(text.input_ids, attention_mask = text.attention_mask,                      
                                             return_dict = True, mode = 'text')            
             text_embeds = text_output.last_hidden_state
+            text_sequence = F.normalize(self.text_proj(text_embeds),dim=-1)
             text_feat = F.normalize(self.text_proj(text_embeds[:,0,:]),dim=-1)                 
-                
+            
+            ##================= mask modeling ========================## 
+            # get token of interest
+            image_score = self.image_mlp(image_embeds).squeeze(2)
+            text_score = self.text_mlp(text_embeds).squeeze(2)
+
+            image_score.masked_fill_(torch.tensor((1 - image_atts), dtype=torch.bool), float("-inf"))
+            text_score.masked_fill_(torch.tensor((1 - text.attention_mask), dtype=torch.bool), float("-inf"))
+            
+            image_score, text_score = torch.softmax(image_score, dim=-1), torch.softmax(text_score, dim=-1)
+            
+            # mask text and image
+            masked_image, masked_vec_image = self._mask_feat(image_embeds, image_atts.sum(1), image_score, mask_rate=0.3)
+            masked_text, masked_vec_text = self._mask_feat(text_embeds, text.attention_mask.sum(1), text_score, mask_rate=0.3)
+
+            # rec text and image
+            rec_image = self.rec_image_trans(text_embeds, None, masked_image, None,  decoding=2, gauss_weight=text_score)[1]
+            rec_text = self.rec_text_trans(image_embeds, None, masked_text, None,  decoding=2, gauss_weight=image_score)[1]
+
+            # get loss
+            
+            real_pos = torch.ones(image_embeds.size()[0]).to(image.device)
+            real_pos[real_label_pos] = 0
+            text_mse = self.mse_loss(rec_text, text_embeds) * masked_vec_text * text_score.unsqueeze(2) * real_pos.unsqueeze(1).unsqueeze(1)
+            image_mse = self.mse_loss(rec_image, image_embeds) * masked_vec_image * image_score.unsqueeze(2)  * real_pos.unsqueeze(1).unsqueeze(1)
+
+            text_sim = self.cos_sim(image_embeds, rec_text, image_atts, text.attention_mask, image_score, text_score,  real_pos)
+            image_sim = self.cos_sim(rec_image, text_embeds, image_atts, text.attention_mask, image_score, text_score,  real_pos)
+
+            loss_REC = (1 - text_mse.mean()) + (1 - image_mse.mean()) + text_sim + image_sim
+
             # get momentum features
             with torch.no_grad():
                 self._momentum_update()
@@ -291,7 +349,7 @@ class HAMMER(nn.Module):
 
             loss_TMG = token_cls_output.loss
 
-            return loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC
+            return loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC, loss_REC
 
         else:
             image_embeds = self.visual_encoder(image) 
@@ -339,6 +397,49 @@ class HAMMER(nn.Module):
                                         return_logits = True,   
                                         )     
             return logits_real_fake, logits_multicls, output_coord, logits_tok   
+
+
+    def cos_sim(self, image, text, image_mask, text_mask, image_score, text_score, real_pos):
+        text = text/text.norm(dim=-1, keepdim=True)
+        image = image/image.norm(dim=-1, keepdim=True)
+
+        logits = torch.einsum('atd,bvd->abtv', [text, image])
+        logits = torch.einsum('abtv,at->abtv', [logits, text_mask])
+        logits = torch.einsum('abtv,bv->abtv', [logits, image_mask])
+        t2i_logits, max_idx1 = logits.max(dim=-1)  # abtv -> abt
+        t2i_logits = torch.einsum('abt,at->ab', [t2i_logits, text_score])
+
+        i2t_logits, max_idx2 = logits.max(dim=-2)  # abtv -> abv
+        i2t_logits = torch.einsum('abv,bv->ab', [i2t_logits, image_score])
+        logits = (t2i_logits + i2t_logits) / 2.0  
+        logit_scale = 100
+        loss_t2v = self.sim_loss(t2i_logits * logit_scale, real_pos)
+        loss_v2t = self.sim_loss(i2t_logits * logit_scale, real_pos)
+        
+        loss = (loss_t2v + loss_v2t) / 2
+
+        return loss
+
+    def _mask_feat(self, feat, feat_len, weights=None, mask_rate = 0.3):
+        
+        masked_vec = []
+        for i, l in enumerate(feat_len):
+            l = int(l)
+            # num_masked_vec = max(l // 3, 1) 
+            num_masked_vec = max(int(l * mask_rate), 1) 
+            masked_vec.append(torch.zeros([feat.size(1)]).byte().cuda())
+            if l < 1:
+                continue
+            p = weights[i, :l].cpu().detach().numpy() if weights is not None else None
+            # choices = np.random.choice(np.arange(l), num_masked_vec, replace=False)
+            choices = np.random.choice(np.arange(l), num_masked_vec, replace=False, p=p)
+            # choices = torch.topk(weights[i, :l], k=num_masked_vec)[1]
+            masked_vec[-1][choices] = 1
+
+        masked_vec = torch.stack(masked_vec, 0).unsqueeze(-1)
+        # out_feat = feat.masked_fill(masked_vec == 1, float("-inf"))
+        out_feat = feat.masked_fill(masked_vec == 1, 0)
+        return out_feat, masked_vec
 
 
     @torch.no_grad()    
