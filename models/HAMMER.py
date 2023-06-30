@@ -223,8 +223,9 @@ class HAMMER(nn.Module):
 
             text_sim = self.cos_sim(image_embeds, rec_text, image_atts, text.attention_mask, image_score, text_score,  real_pos)
             image_sim = self.cos_sim(rec_image, text_embeds, image_atts, text.attention_mask, image_score, text_score,  real_pos)
+            sim = self.cos_sim(image_embeds, text_embeds, image_atts, text.attention_mask, image_score, text_score,  1 - real_pos)
 
-            loss_REC = (1 - text_mse.mean()) + (1 - image_mse.mean()) + text_sim + image_sim
+            loss_REC = ((1 - text_mse.mean()) + (1 - image_mse.mean())) /2 + (text_sim + image_sim) /2 + sim
 
             # get momentum features
             with torch.no_grad():
@@ -412,9 +413,9 @@ class HAMMER(nn.Module):
         i2t_logits, max_idx2 = logits.max(dim=-2)  # abtv -> abv
         i2t_logits = torch.einsum('abv,bv->ab', [i2t_logits, image_score])
         logits = (t2i_logits + i2t_logits) / 2.0  
-        logit_scale = 100
-        loss_t2v = self.sim_loss(t2i_logits * logit_scale, real_pos)
-        loss_v2t = self.sim_loss(i2t_logits * logit_scale, real_pos)
+
+        loss_t2v = self.sim_loss(t2i_logits / self.temp, real_pos)
+        loss_v2t = self.sim_loss(i2t_logits / self.temp, real_pos)
         
         loss = (loss_t2v + loss_v2t) / 2
 
